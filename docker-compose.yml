@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: tanvelo_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: tanvelo
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  tanvelo_api:
+    build: .
+    container_name: tanvelo_backend
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      - TANVELO_ENV=development
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgrespassword@db:5432/tanvelo
+      - SECRET_KEY=tv_sec_hackathon_demo_secret_key
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
+      - DUPLICATE_SIMILARITY_THRESHOLD=0.90
+      - RANKING_WEIGHT_SIMILARITY=0.60
+      - RANKING_WEIGHT_IMPORTANCE=0.25
+      - RANKING_WEIGHT_RECENCY=0.15
+    volumes:
+      - .:/app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+volumes:
+  pgdata:
