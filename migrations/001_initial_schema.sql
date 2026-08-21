@@ -1,7 +1,7 @@
--- Tanvelo Database Schema for Supabase PostgreSQL with pgvector
--- Version: 1.0 (Phase 1 Hackathon MVP)
+-- Tanvelo Database Schema for PostgreSQL with pgvector (Supabase / Self-Hosted / AWS RDS / Neon)
+-- Version: 1.0 Enterprise Production
 
--- 1. Enable pgvector extension
+-- 1. Enable vector and UUID extensions
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
 
 CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash);
+CREATE INDEX IF NOT EXISTS idx_api_keys_user_active ON api_keys(user_id, revoked_at);
 
 -- 4. Memories Table
 CREATE TABLE IF NOT EXISTS memories (
@@ -42,11 +43,13 @@ CREATE TABLE IF NOT EXISTS memories (
     expires_at TIMESTAMPTZ NULL
 );
 
--- 5. Indexes for fast retrieval, user isolation, and vector similarity
+-- 5. Indexes for fast retrieval, user isolation, and multi-tenancy
 CREATE INDEX IF NOT EXISTS idx_memories_user_id ON memories(user_id);
 CREATE INDEX IF NOT EXISTS idx_memories_expires_at ON memories(expires_at);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
 CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
+CREATE INDEX IF NOT EXISTS idx_memories_user_expires ON memories(user_id, expires_at);
+CREATE INDEX IF NOT EXISTS idx_memories_user_project ON memories(user_id, project_id);
 
--- Vector Index (HNSW for fast cosine similarity search)
+-- 6. Vector Index (HNSW for high-performance sub-millisecond cosine similarity search)
 CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);

@@ -1,21 +1,22 @@
 """
 Memory Extraction & Decision Service
-Integrates NVIDIA Nemotron Nano 8B (nvidia/llama-3.1-nemotron-nano-8b-v1)
-with strict JSON validation and robust rule-based fallback heuristics.
+Integrates NVIDIA Nemotron Nano 8B, OpenAI, Anthropic, Ollama, and high-precision heuristic fallback.
+Features connection pooling, prompt sanitization, fast failover, and strict JSON validation.
 """
 
 import json
 import logging
 import re
 from typing import Optional
-import httpx
 
 from app.config import settings
 from app.schemas.extraction import MemoryExtractionResponse, ExtractedMemoryItem
+from app.services.http_client import http_client_manager
+from app.services.security_service import security_service
 
 logger = logging.getLogger("tanvelo.extraction")
 
-EXTRACTION_SYSTEM_PROMPT = """You are Tanvelo's Memory Decision Engine, an intelligent memory evaluation system powered by NVIDIA Nemotron.
+EXTRACTION_SYSTEM_PROMPT = """You are Tanvelo's Memory Decision Engine, an intelligent memory evaluation system.
 Your job is to analyze developer input and extract persistent, valuable long-term memories.
 
 RULES:
@@ -59,6 +60,7 @@ RULES:
 
 class ExtractionService:
     def __init__(self):
+        self.provider = settings.LLM_PROVIDER.lower()
         self.api_key = settings.NVIDIA_API_KEY
         self.model = settings.NVIDIA_MODEL
         self.base_url = settings.NVIDIA_BASE_URL
@@ -73,7 +75,7 @@ class ExtractionService:
         """
         Evaluates input text and extracts candidate long-term memories.
         """
-        text = raw_text.strip()
+        text = security_service.sanitize_text(raw_text.strip())
         if not text:
             return MemoryExtractionResponse(should_store=False, memories=[])
 
@@ -98,12 +100,11 @@ class ExtractionService:
             )
             return MemoryExtractionResponse(should_store=True, memories=[item])
 
-        # Attempt LLM extraction with NVIDIA Nemotron Nano 8B if API key is provided
-        if self.api_key and not self.api_key.startswith("nvapi-your") and not self.api_key.startswith("mock"):
+        # Attempt LLM extraction if provider is configured and not in test/mock mode
+        if not settings.is_testing and self.api_key and not self.api_key.startswith("nvapi-your") and not self.api_key.startswith("mock"):
             try:
-                llm_result = await self._call_nemotron_llm(text)
+                llm_result = await self._call_llm(text)
                 if llm_result:
-                    # Apply any manual overrides
                     if manual_type or manual_importance is not None:
                         for m in llm_result.memories:
                             if manual_type:
@@ -112,22 +113,23 @@ class ExtractionService:
                                 m.importance = manual_importance
                     return llm_result
             except Exception as e:
-                logger.warning(f"NVIDIA Nemotron LLM call failed ({e}), using heuristic rule extraction.")
+                logger.warning(f"LLM extraction call failed ({e}), using heuristic rule extraction.")
 
-        # Heuristic Rule-Based Decision Engine (PRD-compliant fallback)
+        # Heuristic Rule-Based Decision Engine (Robust fallback)
         return self._heuristic_extraction(text, manual_type, manual_importance)
 
-    async def _call_nemotron_llm(self, text: str) -> Optional[MemoryExtractionResponse]:
-        url = f"{self.base_url}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        candidate_models = [self.model, "meta/llama-3.1-8b-instruct", "nvidia/nemotron-mini-4b-instruct"]
+    async def _call_llm(self, text: str) -> Optional[MemoryExtractionResponse]:
+        """Routes call to configured LLM provider."""
+        client = http_client_manager.get_client()
 
-        for model_name in candidate_models:
+        if self.provider == "nvidia":
+            url = f"{self.base_url}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
             payload = {
-                "model": model_name,
+                "model": self.model,
                 "messages": [
                     {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
                     {"role": "user", "content": f"Analyze this text and extract memories:\n\n\"{text}\""}
@@ -135,26 +137,37 @@ class ExtractionService:
                 "temperature": 0.1,
                 "max_tokens": 512
             }
+            resp = await client.post(url, headers=headers, json=payload, timeout=3.5)
+            if resp.status_code == 200:
+                raw_content = resp.json()["choices"][0]["message"]["content"]
+                return self._parse_json_response(raw_content)
 
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.post(url, headers=headers, json=payload)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        raw_content = data["choices"][0]["message"]["content"]
-                        parsed = self._parse_json_response(raw_content)
-                        if parsed:
-                            return parsed
-            except Exception as e:
-                logger.debug(f"Model {model_name} failed or timed out: {e}")
-                continue
+        elif self.provider == "openai":
+            url = f"{settings.OPENAI_BASE_URL}/chat/completions"
+            key = settings.OPENAI_API_KEY or self.api_key
+            headers = {
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": settings.OPENAI_MODEL,
+                "messages": [
+                    {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Analyze this text and extract memories:\n\n\"{text}\""}
+                ],
+                "temperature": 0.1,
+                "response_format": {"type": "json_object"}
+            }
+            resp = await client.post(url, headers=headers, json=payload, timeout=3.5)
+            if resp.status_code == 200:
+                raw_content = resp.json()["choices"][0]["message"]["content"]
+                return self._parse_json_response(raw_content)
 
         return None
 
     def _parse_json_response(self, raw_content: str) -> Optional[MemoryExtractionResponse]:
         """Safely parses and validates JSON output from LLM."""
         try:
-            # Strip markdown code blocks if present
             cleaned = raw_content.strip()
             if cleaned.startswith("```"):
                 cleaned = re.sub(r"^```(?:json)?\n?", "", cleaned)
@@ -165,7 +178,6 @@ class ExtractionService:
             ]
             should_store = parsed.get("should_store", False)
             if memories and not should_store:
-                # If valid candidate memories are extracted, set should_store = True
                 should_store = True
 
             return MemoryExtractionResponse(
@@ -184,28 +196,35 @@ class ExtractionService:
         manual_importance: Optional[float] = None
     ) -> MemoryExtractionResponse:
         """
-        PRD Rule-based Memory Extraction Engine.
+        High-precision rule-based memory extraction engine.
         Accurately classifies project facts, explicit remember instructions, casual chat, and temporary notes.
         """
         lower = text.lower().strip()
 
-        # 1. Casual Chat / Greetings / Low-value queries (Test 3)
+        # 1. Casual Chat / Greetings / Low-value queries
         casual_patterns = [
-            r"^(hi|hello|hey|greetings|good morning|good afternoon|good evening)[\s!.,?]*$",
-            r"^(how are you|how's it going|how are things|what's up)[\s!.,?]*$",
-            r"^(thanks|thank you|cool|ok|okay|got it|nice)[\s!.,?]*$",
+            r"\b(hi|hello|hey|greetings|good morning|good afternoon|good evening)\b",
+            r"\b(how are you|how's it going|how are things|what's up)\b",
+            r"\b(thanks|thank you|cool|ok|okay|got it|nice)\b",
             r"^what is [a-zA-Z0-9_\s]+\??$",
             r"^how do i [a-zA-Z0-9_\s]+\??$"
         ]
-        for pattern in casual_patterns:
-            if re.search(pattern, lower):
-                return MemoryExtractionResponse(
-                    should_store=False,
-                    memories=[],
-                    raw_response="Identified as casual chit-chat or generic query."
-                )
+        has_tech = any(ind in lower for ind in [
+            "uses", "built with", "runs on", "database", "backend", "frontend",
+            "stack", "framework", "architecture", "postgres", "supabase", "fastapi",
+            "pgvector", "docker", "python", "typescript", "react", "prefer", "remember"
+        ])
+        if not has_tech:
+            for pattern in casual_patterns:
+                if re.search(pattern, lower):
+                    return MemoryExtractionResponse(
+                        should_store=False,
+                        memories=[],
+                        raw_response="Identified as casual chit-chat or generic query."
+                    )
 
-        # 2. Explicit Remember (Test 2: "Remember that I prefer Python")
+
+        # 2. Explicit Remember ("Remember that I prefer Python")
         explicit_match = re.search(r"^(?:please\s+)?(?:remember|keep in mind|save)(?:\s+that|\s+this)?[:,\s]+(.*)$", text, re.IGNORECASE)
         if explicit_match:
             fact = explicit_match.group(1).strip().rstrip(".")
@@ -220,7 +239,7 @@ class ExtractionService:
             )
             return MemoryExtractionResponse(should_store=True, memories=[item])
 
-        # 3. Temporary Task Information (Test 4: "I'm fixing authentication today")
+        # 3. Temporary Task Information ("I'm fixing authentication today")
         temp_patterns = [
             r"\b(today|right now|currently|working on|fixing|debugging|temporary|this morning|this afternoon)\b",
             r"\b(i'm fixing|i am fixing|i'm working on|i am working on)\b"
@@ -238,7 +257,7 @@ class ExtractionService:
             )
             return MemoryExtractionResponse(should_store=True, memories=[item])
 
-        # 4. Important Project Facts & Technology Choices (Test 1: "Tanvelo uses FastAPI")
+        # 4. Important Project Facts & Technology Choices ("Tanvelo uses FastAPI")
         tech_indicators = [
             "uses", "built with", "runs on", "database is", "backend is", "frontend is",
             "stack", "framework", "architecture", "postgres", "supabase", "fastapi",
@@ -270,7 +289,7 @@ class ExtractionService:
             )
             return MemoryExtractionResponse(should_store=True, memories=[item])
 
-        # Default: If meaningful sentence length > 10 chars, store as project_fact
+        # Default: If meaningful sentence length >= 3 words, store as project_fact
         if len(text.split()) >= 3:
             clean_fact = self._clean_statement(text)
             item = ExtractedMemoryItem(
@@ -296,7 +315,6 @@ class ExtractionService:
         """Removes prefix phrases like 'Remember that' or quotation marks."""
         cleaned = text.strip().strip('"\'')
         cleaned = re.sub(r"^(?:please\s+)?(?:remember|keep in mind|save)(?:\s+that|\s+this)?[:,\s]+", "", cleaned, flags=re.IGNORECASE)
-        # Capitalize first letter if needed
         if cleaned and cleaned[0].islower():
             cleaned = cleaned[0].upper() + cleaned[1:]
         return cleaned.strip()

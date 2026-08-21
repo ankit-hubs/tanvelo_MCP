@@ -1,14 +1,15 @@
 version: '3.8'
 
 services:
+  # 1. PostgreSQL Database with pgvector Extension
   db:
     image: pgvector/pgvector:pg16
     container_name: tanvelo_postgres
-    restart: always
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgrespassword
-      POSTGRES_DB: tanvelo
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgrespassword}
+      POSTGRES_DB: ${POSTGRES_DB:-tanvelo}
     ports:
       - "5432:5432"
     volumes:
@@ -19,29 +20,68 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - tanvelo-net
 
-  tanvelo_api:
-    build: .
-    container_name: tanvelo_backend
-    restart: always
+  # 2. Tanvelo FastAPI REST API Backend
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tanvelo_api
+    restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
     ports:
       - "8000:8000"
     environment:
-      - TANVELO_ENV=development
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgrespassword@db:5432/tanvelo
-      - SECRET_KEY=tv_sec_hackathon_demo_secret_key
+      - TANVELO_ENV=production
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgrespassword}@db:5432/${POSTGRES_DB:-tanvelo}
+      - SECRET_KEY=${SECRET_KEY:-tv_sec_production_secret_key_change_me}
       - NVIDIA_API_KEY=${NVIDIA_API_KEY}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
-      - DUPLICATE_SIMILARITY_THRESHOLD=0.90
-      - RANKING_WEIGHT_SIMILARITY=0.60
-      - RANKING_WEIGHT_IMPORTANCE=0.25
-      - RANKING_WEIGHT_RECENCY=0.15
-    volumes:
-      - .:/app
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+      - LLM_PROVIDER=${LLM_PROVIDER:-nvidia}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-nvidia}
+      - RATE_LIMIT_ENABLED=true
+      - RATE_LIMIT_PER_MINUTE=120
+      - DB_POOL_SIZE=10
+      - DB_MAX_OVERFLOW=20
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    networks:
+      - tanvelo-net
+
+  # 3. Tanvelo Remote MCP Server (SSE Transport)
+  mcp_server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tanvelo_mcp
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8001:8001"
+    environment:
+      - TANVELO_ENV=production
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgrespassword}@db:5432/${POSTGRES_DB:-tanvelo}
+      - SECRET_KEY=${SECRET_KEY:-tv_sec_production_secret_key_change_me}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
+      - TANVELO_API_KEY=${TANVELO_API_KEY}
+    command: ["python", "-m", "app.mcp.runner", "--transport", "sse", "--port", "8001"]
+    networks:
+      - tanvelo-net
 
 volumes:
   pgdata:
+    driver: local
+
+networks:
+  tanvelo-net:
+    driver: bridge

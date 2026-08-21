@@ -1,0 +1,6 @@
+# Tanvelo Memory Rules for Windsurf
+
+## Autonomous Memory Protocol
+
+1. **Pre-flight Retrieval**: On any user prompt or code task, invoke Tanvelo's `get_context(query="<user query>")` first to check for existing architecture decisions and developer preferences.
+2. **Proactive Storage**: Whenever important project decisions, conventions, or tech stacks are established, automatically call `save_memory(content="...")` without requiring explicit user instructions.

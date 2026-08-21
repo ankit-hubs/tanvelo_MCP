@@ -3,10 +3,17 @@ Pytest configuration and test fixtures for Tanvelo
 """
 
 import asyncio
+import os
 import pytest
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from httpx import AsyncClient, ASGITransport
+
+from app.config import settings
+
+# Force testing environment for fast, isolated, deterministic unit testing
+settings.TANVELO_ENV = "testing"
+settings.RATE_LIMIT_ENABLED = False
 
 from app.database import Base, get_db
 from app.main import app

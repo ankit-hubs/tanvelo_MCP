@@ -9,11 +9,24 @@ from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.types import TypeDecorator, TEXT
 from app.config import settings
 
-# Engine configuration
+# Engine configuration with dialect-aware pooling
+engine_kwargs = {
+    "echo": False,
+    "future": True,
+}
+
+if "postgresql" in settings.DATABASE_URL:
+    engine_kwargs.update({
+        "pool_size": settings.DB_POOL_SIZE,
+        "max_overflow": settings.DB_MAX_OVERFLOW,
+        "pool_timeout": settings.DB_POOL_TIMEOUT,
+        "pool_recycle": settings.DB_POOL_RECYCLE,
+        "pool_pre_ping": settings.DB_POOL_PRE_PING,
+    })
+
 engine = create_async_engine(
     settings.DATABASE_URL,
-    echo=False,
-    future=True,
+    **engine_kwargs
 )
 
 async_session_factory = async_sessionmaker(
@@ -88,3 +101,15 @@ async def init_db():
     """Initializes database tables if they do not exist."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+async def check_database_health() -> tuple[bool, str]:
+    """Tests active database connection."""
+    try:
+        from sqlalchemy import text
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        return True, "connected"
+    except Exception as e:
+        return False, str(e)
+

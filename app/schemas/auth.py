@@ -27,3 +27,19 @@ class UserInfo(BaseModel):
     created_at: datetime
     active_keys_count: int
     memories_count: int
+
+
+class ApiKeyListItem(BaseModel):
+    id: str
+    name: str
+    masked_key: str
+    created_at: datetime
+    last_used_at: Optional[datetime] = None
+    is_active: bool
+
+
+class ApiKeyRevokeResponse(BaseModel):
+    success: bool
+    key_id: str
+    message: str
+

@@ -1,8 +1,9 @@
 """
 Authentication Router and User Resolution Dependency
+Provides API key creation, verification, listing, revocation, and user introspection.
 """
 
-from typing import Optional
+from typing import List, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Security, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,8 +13,13 @@ from app.database import get_db
 from app.models.user import User
 from app.models.api_key import ApiKey
 from app.models.memory import Memory
-from app.schemas.auth import ApiKeyCreate, ApiKeyResponse, UserInfo
-from app.services.auth_service import create_user_and_api_key, validate_api_key
+from app.schemas.auth import ApiKeyCreate, ApiKeyResponse, ApiKeyListItem, ApiKeyRevokeResponse, UserInfo
+from app.services.auth_service import (
+    create_user_and_api_key,
+    validate_api_key,
+    list_user_api_keys,
+    revoke_user_api_key
+)
 
 router = APIRouter(prefix="/v1/auth", tags=["Authentication"])
 security = HTTPBearer(auto_error=False)
@@ -69,6 +75,35 @@ async def create_api_key(request: ApiKeyCreate, db: AsyncSession = Depends(get_d
         user_id=user.id,
         name=key_model.name,
         created_at=key_model.created_at
+    )
+
+
+@router.get("/keys", response_model=List[ApiKeyListItem])
+async def list_keys(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Lists all API keys belonging to authenticated user with masked display."""
+    return await list_user_api_keys(db=db, user_id=user.id)
+
+
+@router.delete("/keys/{key_id}", response_model=ApiKeyRevokeResponse)
+async def revoke_key(
+    key_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Revokes an active API key."""
+    revoked = await revoke_user_api_key(db=db, user_id=user.id, key_id=key_id)
+    if not revoked:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Active API key '{key_id}' not found or already revoked."
+        )
+    return ApiKeyRevokeResponse(
+        success=True,
+        key_id=key_id,
+        message=f"API key '{key_id}' revoked successfully."
     )
 
 

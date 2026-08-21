@@ -1,5 +1,7 @@
 """
 Tanvelo FastAPI Main Application
+Production-grade long-term memory server with connection pooling, security middlewares,
+rate limiting, request tracing, and OpenAPI documentation.
 """
 
 import logging
@@ -14,6 +16,13 @@ from app.database import init_db
 from app.api.health import router as health_router
 from app.api.auth import router as auth_router
 from app.api.memories import router as memories_router
+from app.middleware.security import (
+    SecurityHeadersMiddleware,
+    CorrelationIdMiddleware,
+    BodySizeLimitMiddleware,
+    RateLimitMiddleware
+)
+from app.services.http_client import http_client_manager
 
 # Configure logging
 logging.basicConfig(
@@ -25,12 +34,14 @@ logger = logging.getLogger("tanvelo")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle manager for database initialization and cleanup."""
+    """Lifecycle manager for database initialization and persistent resource cleanup."""
     logger.info("Initializing Tanvelo Memory Layer...")
     await init_db()
     logger.info("Tanvelo Database initialized successfully.")
     yield
-    logger.info("Shutting down Tanvelo.")
+    logger.info("Shutting down Tanvelo. Releasing HTTP client connection pools...")
+    await http_client_manager.close_client()
+    logger.info("Tanvelo cleanup complete.")
 
 
 app = FastAPI(
@@ -42,10 +53,16 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-# CORS configuration
+# 1. Custom Operational & Security Middlewares (Outer to Inner)
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(CorrelationIdMiddleware)
+app.add_middleware(BodySizeLimitMiddleware)
+app.add_middleware(RateLimitMiddleware, max_requests=settings.RATE_LIMIT_PER_MINUTE)
+
+# 2. CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -58,15 +75,16 @@ async def log_requests(request: Request, call_next):
     start_time = time.time()
     response = await call_next(request)
     duration_ms = (time.time() - start_time) * 1000.0
+    req_id = getattr(request.state, "request_id", "-")
     logger.info(
-        f"{request.method} {request.url.path} status={response.status_code} latency={duration_ms:.2f}ms"
+        f"[{req_id}] {request.method} {request.url.path} status={response.status_code} latency={duration_ms:.2f}ms"
     )
     return response
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """Global exception handler to avoid exposing raw stack traces."""
+    """Global exception handler to avoid exposing raw internal stack traces."""
     logger.error(f"Unhandled exception on {request.method} {request.url.path}: {str(exc)}", exc_info=True)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -87,9 +105,10 @@ app.include_router(memories_router)
 @app.get("/")
 async def root():
     return {
-        "product": "Tanvelo Memory",
+        "product": "Tanvelo Memory Layer",
         "tagline": "Connect Once. Remember Everywhere.",
         "version": "1.0.0",
+        "environment": settings.TANVELO_ENV,
         "health_check": "/health",
         "docs": "/docs"
     }

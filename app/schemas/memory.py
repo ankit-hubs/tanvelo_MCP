@@ -80,3 +80,44 @@ class MemoryListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class MemoryUpdateRequest(BaseModel):
+    content: Optional[str] = Field(default=None, description="Updated content text")
+    type: Optional[str] = Field(default=None, description="Updated memory type")
+    importance: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Updated importance score")
+    expires_in_hours: Optional[float] = Field(default=None, description="Reset expiration in hours from now")
+
+
+class MemoryBulkSaveRequest(BaseModel):
+    memories: List[MemorySaveRequest] = Field(description="List of memories to evaluate and store")
+
+
+class MemoryBulkSaveResponse(BaseModel):
+    total_processed: int
+    created: int
+    updated: int
+    ignored: int
+    results: List[MemorySaveResponse]
+
+
+class MemoryStatsResponse(BaseModel):
+    total_memories: int
+    active_memories: int
+    expired_memories: int
+    by_type: dict[str, int]
+    by_project: dict[str, int]
+    oldest_memory: Optional[datetime] = None
+    newest_memory: Optional[datetime] = None
+
+
+class MemoryExportResponse(BaseModel):
+    format: str
+    total: int
+    exported_at: datetime
+    content: str
+
+
+class MemoryCleanupResponse(BaseModel):
+    deleted_count: int
+    message: str

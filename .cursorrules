@@ -1,0 +1,21 @@
+# Tanvelo Universal AI Memory Layer - Autonomous Behavior Rules
+
+## 1. Autonomous Pre-flight Memory Retrieval (ALWAYS CHECK FIRST)
+Before answering any user question, planning architecture, writing code, or suggesting implementations:
+- ALWAYS first invoke the Tanvelo MCP tool `get_context(query="<user query or task summary>")`.
+- Use the retrieved long-term memory context (project decisions, coding conventions, preferred libraries, database choices, user preferences) to guide your response.
+- Do NOT ask the user to repeat or re-specify details that are already present in Tanvelo memory.
+
+## 2. Autonomous Implicit Memory Storage (STORE IMPORTANT FACTS)
+Whenever the user mentions or confirms:
+- Architectural decisions (e.g., "We are using FastAPI and PostgreSQL with pgvector")
+- Tech stack choices & library versions
+- Coding conventions, styling preferences, or workflow patterns
+- Database schema details, API contract patterns, or deployment targets
+- Personal developer preferences (e.g., "I prefer async/await", "Use pytest over unittest")
+
+ACTION:
+- Automatically invoke `save_memory(content="<concise atomic fact>", type="<project_fact|preference|decision>")` in the background.
+- You do NOT need the user to explicitly say "remember this". If it is important and durable knowledge, persist it immediately.
+- If the user contradicts or updates an existing decision, invoke `save_memory` or `update_memory` with the updated fact so Tanvelo can update it in-place.
+- Do NOT store transient debugging output, temporary file paths, or casual greetings.

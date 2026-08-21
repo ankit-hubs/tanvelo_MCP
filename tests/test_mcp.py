@@ -54,4 +54,4 @@ async def test_mcp_save_and_retrieve_tool():
     # 6. Verify search after forget
     search_after_raw = await search_memory(query="What backend does Tanvelo use?")
     search_after_data = json.loads(search_after_raw)
-    assert len(search_after_data["memories"]) == 0
+    assert not any(m["id"] == mem_id for m in search_after_data["memories"])

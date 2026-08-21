@@ -1,16 +1,18 @@
 """
 Authentication and API Key Service
+Handles secure SHA-256 key hashing, tenant validation, key issuance, listing, and revocation.
 """
 
 import hashlib
 import secrets
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.user import User
 from app.models.api_key import ApiKey
+from app.schemas.auth import ApiKeyListItem
 
 
 def generate_api_key() -> str:
@@ -82,7 +84,7 @@ async def validate_api_key(db: AsyncSession, raw_key: str) -> Optional[User]:
 
     api_key, user = row
 
-    # Update last_used_at timestamp asynchronously
+    # Update last_used_at timestamp
     await db.execute(
         update(ApiKey)
         .where(ApiKey.id == api_key.id)
@@ -91,3 +93,41 @@ async def validate_api_key(db: AsyncSession, raw_key: str) -> Optional[User]:
     await db.commit()
 
     return user
+
+
+async def list_user_api_keys(db: AsyncSession, user_id: str) -> List[ApiKeyListItem]:
+    """Lists all API keys for user with masked presentation."""
+    stmt = (
+        select(ApiKey)
+        .where(ApiKey.user_id == user_id)
+        .order_by(ApiKey.created_at.desc())
+    )
+    res = await db.execute(stmt)
+    keys = res.scalars().all()
+
+    items = []
+    for k in keys:
+        masked = f"tv_live_...{k.key_hash[:8]}"
+        items.append(
+            ApiKeyListItem(
+                id=k.id,
+                name=k.name,
+                masked_key=masked,
+                created_at=k.created_at,
+                last_used_at=k.last_used_at,
+                is_active=(k.revoked_at is None)
+            )
+        )
+    return items
+
+
+async def revoke_user_api_key(db: AsyncSession, user_id: str, key_id: str) -> bool:
+    """Revokes a specific API key belonging to user."""
+    stmt = (
+        update(ApiKey)
+        .where(ApiKey.id == key_id, ApiKey.user_id == user_id, ApiKey.revoked_at.is_(None))
+        .values(revoked_at=datetime.now(timezone.utc))
+    )
+    res = await db.execute(stmt)
+    await db.commit()
+    return (res.rowcount or 0) > 0

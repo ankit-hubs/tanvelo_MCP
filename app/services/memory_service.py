@@ -1,11 +1,13 @@
 """
 Core Memory Orchestration Service
-Coordinates extraction, embedding, duplicate resolution, persistence, context generation, and deletion.
+Coordinates extraction, embedding, duplicate resolution, persistence, context generation,
+updating, statistics, bulk operations, export, and expiration cleanup.
 """
 
+import json
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,10 +15,16 @@ from app.models.memory import Memory, generate_memory_id
 from app.schemas.memory import (
     MemorySaveRequest,
     MemorySaveResponse,
+    MemoryUpdateRequest,
+    MemoryBulkSaveRequest,
+    MemoryBulkSaveResponse,
     MemorySearchResponse,
     MemoryContextResponse,
     MemoryForgetResponse,
     MemoryListResponse,
+    MemoryStatsResponse,
+    MemoryExportResponse,
+    MemoryCleanupResponse,
     MemoryRecord
 )
 from app.services.extraction_service import extraction_service
@@ -129,6 +137,66 @@ class MemoryService:
             message=f"Memory successfully {overall_action}."
         )
 
+    async def update_memory(
+        self,
+        db: AsyncSession,
+        user_id: str,
+        memory_id: str,
+        request: MemoryUpdateRequest
+    ) -> Optional[MemoryRecord]:
+        """Updates specific fields of an existing memory."""
+        stmt = select(Memory).where(Memory.id == memory_id, Memory.user_id == user_id)
+        res = await db.execute(stmt)
+        mem = res.scalars().first()
+        if not mem:
+            return None
+
+        now_utc = datetime.now(timezone.utc)
+        if request.content is not None:
+            mem.content = request.content
+            mem.embedding = await embedding_service.get_embedding(request.content)
+        if request.type is not None:
+            mem.type = request.type
+        if request.importance is not None:
+            mem.importance = request.importance
+        if request.expires_in_hours is not None:
+            mem.expires_at = now_utc + timedelta(hours=request.expires_in_hours)
+
+        mem.updated_at = now_utc
+        await db.commit()
+        await db.refresh(mem)
+        return self._to_record(mem)
+
+    async def bulk_save_memories(
+        self,
+        db: AsyncSession,
+        user_id: str,
+        request: MemoryBulkSaveRequest
+    ) -> MemoryBulkSaveResponse:
+        """Processes and stores a batch of memories in sequence."""
+        created_count = 0
+        updated_count = 0
+        ignored_count = 0
+        results: List[MemorySaveResponse] = []
+
+        for item_req in request.memories:
+            res = await self.save_memory(db=db, user_id=user_id, request=item_req)
+            results.append(res)
+            if res.action == "created":
+                created_count += 1
+            elif res.action == "updated":
+                updated_count += 1
+            else:
+                ignored_count += 1
+
+        return MemoryBulkSaveResponse(
+            total_processed=len(request.memories),
+            created=created_count,
+            updated=updated_count,
+            ignored=ignored_count,
+            results=results
+        )
+
     async def search_memories(
         self,
         db: AsyncSession,
@@ -164,9 +232,10 @@ class MemoryService:
         user_id: str,
         query: str,
         limit: int = 5,
-        project_id: Optional[str] = None
+        project_id: Optional[str] = None,
+        max_characters: int = 4000
     ) -> MemoryContextResponse:
-        """Retrieves top memories and formats them as a clean Markdown context block."""
+        """Retrieves top memories and formats them as a clean Markdown context block with budgeting."""
         ranked_results = await retrieval_service.search_memories(
             db=db,
             user_id=user_id,
@@ -187,17 +256,24 @@ class MemoryService:
                 count=0
             )
 
-        # Build clean markdown context for AI tool prompt injection
         lines = ["### [Tanvelo Long-Term Memory Context]"]
+        total_len = len(lines[0])
+        included_records: List[MemoryRecord] = []
+
         for r in records:
-            lines.append(f"- **[{r.type}]**: {r.content} *(importance: {r.importance:.2f})*")
+            line = f"- **[{r.type}]**: {r.content} *(importance: {r.importance:.2f})*"
+            if total_len + len(line) + 1 > max_characters:
+                break
+            lines.append(line)
+            total_len += len(line) + 1
+            included_records.append(r)
 
         context_str = "\n".join(lines)
 
         return MemoryContextResponse(
             context=context_str,
-            memories=records,
-            count=len(records)
+            memories=included_records,
+            count=len(included_records)
         )
 
     async def forget_memory(
@@ -213,7 +289,6 @@ class MemoryService:
         deleted_ids: List[str] = []
 
         if memory_id:
-            # Delete exact memory ID scoped to authenticated user
             stmt = select(Memory).where(Memory.id == memory_id, Memory.user_id == user_id)
             res = await db.execute(stmt)
             mem = res.scalars().first()
@@ -234,9 +309,7 @@ class MemoryService:
                 )
 
         if query:
-            # Search for closest matches to delete
             clean_query = query.strip()
-            # Strip prefixes like "Forget that..."
             for prefix in ["forget that", "forget", "delete memory about", "remove"]:
                 if clean_query.lower().startswith(prefix):
                     clean_query = clean_query[len(prefix):].strip()
@@ -250,7 +323,6 @@ class MemoryService:
             )
 
             if ranked:
-                # Find matching memories by similarity or significant word overlap
                 query_words = set(w.lower() for w in clean_query.split() if len(w) > 3)
                 for mem, sim, _ in ranked:
                     mem_words = set(w.lower() for w in mem.content.split())
@@ -285,6 +357,7 @@ class MemoryService:
         user_id: str,
         limit: int = 20,
         offset: int = 0,
+        project_id: Optional[str] = None,
         memory_type: Optional[str] = None
     ) -> MemoryListResponse:
         """Lists active memories for the user."""
@@ -293,6 +366,7 @@ class MemoryService:
             user_id=user_id,
             limit=limit,
             offset=offset,
+            project_id=project_id,
             memory_type=memory_type
         )
         records = [self._to_record(m) for m in memories]
@@ -301,6 +375,54 @@ class MemoryService:
             total=total,
             limit=limit,
             offset=offset
+        )
+
+    async def get_stats(self, db: AsyncSession, user_id: str) -> MemoryStatsResponse:
+        """Returns statistics for authenticated user's memory repository."""
+        stats = await retrieval_service.get_memory_statistics(db=db, user_id=user_id)
+        return MemoryStatsResponse(**stats)
+
+    async def export_memories(
+        self,
+        db: AsyncSession,
+        user_id: str,
+        format: str = "json",
+        project_id: Optional[str] = None
+    ) -> MemoryExportResponse:
+        """Exports user memories in JSON or Markdown format."""
+        memories, total = await retrieval_service.get_all_active_memories(
+            db=db,
+            user_id=user_id,
+            limit=10000,
+            offset=0,
+            project_id=project_id
+        )
+        records = [self._to_record(m) for m in memories]
+        now_utc = datetime.now(timezone.utc)
+
+        if format.lower() == "markdown":
+            lines = [f"# Tanvelo Memory Export", f"- Exported At: {now_utc.isoformat()}", f"- Total Memories: {total}", ""]
+            for r in records:
+                proj_tag = f" `[{r.project_id}]`" if r.project_id else ""
+                lines.append(f"- **[{r.type}]**{proj_tag}: {r.content} *(importance: {r.importance:.2f})*")
+            content_str = "\n".join(lines)
+        else:
+            export_payload = [r.model_dump(mode="json") for r in records]
+            content_str = json.dumps(export_payload, indent=2, default=str)
+
+        return MemoryExportResponse(
+            format=format.lower(),
+            total=total,
+            exported_at=now_utc,
+            content=content_str
+        )
+
+    async def cleanup_expired(self, db: AsyncSession, user_id: Optional[str] = None) -> MemoryCleanupResponse:
+        """Purges expired memories from storage."""
+        count = await retrieval_service.delete_expired_memories(db=db, user_id=user_id)
+        return MemoryCleanupResponse(
+            deleted_count=count,
+            message=f"Successfully purged {count} expired memory record(s)."
         )
 
     @staticmethod
